@@ -10,12 +10,13 @@ import org.jetbrains.intellij.platform.gradle.buildFile
 import org.jetbrains.intellij.platform.gradle.write
 import kotlin.io.path.invariantSeparatorsPathString
 import kotlin.test.Test
+import kotlin.test.assertTrue
 
 class RunIdeTaskTest : IntelliJPluginTestBase() {
 
     private val isWindows = System.getProperty("os.name").startsWith("Windows")
 
-    private fun configureFakeJavaLauncher() {
+    private fun configureFakeJavaLauncher(joinLinkDelayMs: Int = 0) {
         val fakeJavaExecutable = dir.resolve("fake-jdk/bin/java" + if (isWindows) ".bat" else "")
 
         fakeJavaExecutable write if (isWindows) {
@@ -28,7 +29,10 @@ class RunIdeTaskTest : IntelliJPluginTestBase() {
             echo JETBRAINS_CLIENT_VM_OPTIONS_CONTENT_START
             if not "%JETBRAINS_CLIENT_VM_OPTIONS%"=="" type "%JETBRAINS_CLIENT_VM_OPTIONS%"
             echo JETBRAINS_CLIENT_VM_OPTIONS_CONTENT_END
-            echo %* | findstr /C:"serverMode" >nul && echo Join link: tcp://127.0.0.1:5990#cb=fake
+            echo %* | findstr /C:"serverMode" >nul && (
+              ${if (joinLinkDelayMs > 0) "powershell -NoProfile -Command \"Start-Sleep -Milliseconds $joinLinkDelayMs\"" else "rem no-op"}
+              echo Join link: tcp://127.0.0.1:5990#cb=fake
+            )
             echo ARGS=%*
             """.trimIndent()
         } else {
@@ -44,7 +48,10 @@ class RunIdeTaskTest : IntelliJPluginTestBase() {
             fi
             echo "JETBRAINS_CLIENT_VM_OPTIONS_CONTENT_END"
             case "$*" in
-              *serverMode*) echo "Join link: tcp://127.0.0.1:5990#cb=fake" ;;
+              *serverMode*)
+                ${if (joinLinkDelayMs > 0) "sleep ${joinLinkDelayMs / 1000.0}" else ":"}
+                echo "Join link: tcp://127.0.0.1:5990#cb=fake"
+                ;;
             esac
             echo "ARGS=$*"
             """.trimIndent()
@@ -214,5 +221,39 @@ class RunIdeTaskTest : IntelliJPluginTestBase() {
         build(Tasks.RUN_IDE_FRONTEND) {
             assertContains("com.intellij.platform.runtime.loader.IntellijLoader thinClient tcp://127.0.0.1:5990#cb=delayed", output)
         }
+    }
+
+    @Test
+    fun `runIdeFrontend uses configured join link wait timeout`() {
+        buildFile.toFile().appendText(
+            """
+
+            tasks.named<org.jetbrains.intellij.platform.gradle.tasks.RunIdeTask>("${Tasks.RUN_IDE_FRONTEND}") {
+                splitModeFrontendJoinLinkWaitTimeout.set(200)
+            }
+            """.trimIndent()
+        )
+
+        buildAndFail(Tasks.RUN_IDE_FRONTEND) {
+            assertContains("No split-mode frontend join link available after waiting 200ms.", output)
+        }
+    }
+
+    @Test
+    fun `runIdeSplitMode launches backend and frontend in order`() {
+        configureFakeJavaLauncher(joinLinkDelayMs = 500)
+
+        build(
+            assertValidConfigurationCache = false,
+            tasks = arrayOf(Tasks.RUN_IDE_SPLIT_MODE),
+            block = {
+                val backendIndex = output.indexOf("com.intellij.idea.Main serverMode -p 5990")
+                val frontendIndex = output.indexOf("com.intellij.platform.runtime.loader.IntellijLoader thinClient tcp://127.0.0.1:5990#cb=fake")
+
+                assertTrue(backendIndex >= 0, "Backend launch was not observed in task output.")
+                assertTrue(frontendIndex >= 0, "Frontend launch was not observed in task output.")
+                assertTrue(backendIndex < frontendIndex, "Frontend should launch only after backend exposes the join link.")
+            },
+        )
     }
 }

@@ -2,6 +2,7 @@
 
 package org.jetbrains.intellij.platform.gradle.tasks
 
+import org.gradle.api.GradleException
 import org.gradle.api.InvalidUserDataException
 import org.gradle.api.Project
 import org.gradle.api.file.ConfigurableFileCollection
@@ -29,6 +30,7 @@ import org.jetbrains.intellij.platform.gradle.tasks.aware.SplitModeAware
 import org.jetbrains.intellij.platform.gradle.utils.Logger
 import org.jetbrains.intellij.platform.gradle.utils.asPath
 import org.jetbrains.intellij.platform.gradle.utils.safePathString
+import java.io.File
 import java.io.OutputStream
 import java.util.concurrent.TimeUnit.MILLISECONDS
 import kotlin.io.path.Path
@@ -47,8 +49,8 @@ private const val DEFAULT_JVM_DEBUG_PORT = 5005
 private const val DEFAULT_SPLIT_MODE_FRONTEND_DEBUG_PORT = 5007
 private const val SPLIT_MODE_FRONTEND_REMOTE_ID = "Split Mode"
 private const val SPLIT_MODE_JOIN_LINK_MARKER = "Join link:"
-private const val SPLIT_MODE_JOIN_LINK_WAIT_TIMEOUT_MS = 30_000L
-private const val SPLIT_MODE_JOIN_LINK_POLL_INTERVAL_MS = 200L
+internal const val SPLIT_MODE_JOIN_LINK_WAIT_TIMEOUT_MS = 30_000L
+internal const val SPLIT_MODE_JOIN_LINK_POLL_INTERVAL_MS = 200L
 private const val SPLIT_MODE_REFRESH_TOKEN_ARGUMENT = "--refresh-split-mode-token=true"
 private const val SPLIT_MODE_HOST_PASSWORD_ENV = "CWM_HOST_PASSWORD"
 private const val SPLIT_MODE_CLIENT_PASSWORD_ENV = "CWM_CLIENT_PASSWORD"
@@ -67,6 +69,7 @@ abstract class RunIdeTask : JavaExec(), RunnableIdeAware, SplitModeAware, Intell
     ComposeHotReloadAware {
 
     private val log = Logger(javaClass)
+    private var preparedForExecution = false
 
     @get:Internal
     abstract val executionMode: Property<ExecutionMode>
@@ -86,6 +89,12 @@ abstract class RunIdeTask : JavaExec(), RunnableIdeAware, SplitModeAware, Intell
     @get:Input
     abstract val splitModeFrontendJoinLink: Property<String>
 
+    /**
+     * Timeout in milliseconds used by split-mode frontend launches to wait for a join link produced by the backend.
+     */
+    @get:Input
+    abstract val splitModeFrontendJoinLinkWaitTimeout: Property<Long>
+
     @get:Internal
     abstract val splitModeFrontendBootstrapClasspath: ConfigurableFileCollection
 
@@ -94,6 +103,16 @@ abstract class RunIdeTask : JavaExec(), RunnableIdeAware, SplitModeAware, Intell
      */
     @TaskAction
     override fun exec() {
+        prepareForExecution()
+        super.exec()
+    }
+
+    internal fun prepareForExecution() {
+        if (preparedForExecution) {
+            return
+        }
+        preparedForExecution = true
+
         validateIntelliJPlatformVersion()
         validateSplitModeSupport()
 
@@ -138,9 +157,31 @@ abstract class RunIdeTask : JavaExec(), RunnableIdeAware, SplitModeAware, Intell
         }
 
         systemPropertyDefault("idea.auto.reload.plugins", autoReload.get())
-
-        super.exec()
     }
+
+    internal fun createProcessSpec() = ProcessSpec(
+        workingDirectory = workingDir ?: project.projectDir,
+        environment = environment.mapValues { (_, value) -> value.toString() },
+        commandLine = buildList {
+            add(resolveJavaExecutable())
+            addAll(allJvmArgs)
+
+            val classpath = classpath.files
+                .map(File::getAbsolutePath)
+                .takeIf { it.isNotEmpty() }
+                ?.joinToString(File.pathSeparator)
+
+            if (classpath != null) {
+                add("-cp")
+                add(classpath)
+            }
+
+            add(mainClass.orNull ?: throw GradleException("No main class resolved for task '$path'."))
+            addAll(args)
+        },
+        standardOutput = runCatching { standardOutput }.getOrNull() ?: System.out,
+        errorOutput = runCatching { errorOutput }.getOrNull() ?: System.err,
+    )
 
     private fun validateSplitModeTaskArguments() {
         if (args.isNotEmpty()) {
@@ -172,7 +213,8 @@ abstract class RunIdeTask : JavaExec(), RunnableIdeAware, SplitModeAware, Intell
         readSplitModeFrontendJoinLink(joinLinkPath)?.let { return it }
 
         log.info("Waiting for split-mode frontend join link at '${joinLinkPath.safePathString}'.")
-        val deadline = System.nanoTime() + MILLISECONDS.toNanos(SPLIT_MODE_JOIN_LINK_WAIT_TIMEOUT_MS)
+        val waitTimeout = splitModeFrontendJoinLinkWaitTimeout.get().coerceAtLeast(0L)
+        val deadline = System.nanoTime() + MILLISECONDS.toNanos(waitTimeout)
         while (System.nanoTime() < deadline) {
             try {
                 Thread.sleep(SPLIT_MODE_JOIN_LINK_POLL_INTERVAL_MS)
@@ -185,7 +227,7 @@ abstract class RunIdeTask : JavaExec(), RunnableIdeAware, SplitModeAware, Intell
         }
 
         throw InvalidUserDataException(
-            "No split-mode frontend join link available after waiting ${SPLIT_MODE_JOIN_LINK_WAIT_TIMEOUT_MS / 1000}s. Start `${Tasks.RUN_IDE_BACKEND}` first or set `splitModeFrontendJoinLink` explicitly. Expected file: ${joinLinkPath.safePathString}."
+            "No split-mode frontend join link available after waiting ${waitTimeout}ms. Start `${Tasks.RUN_IDE_BACKEND}` first or set `splitModeFrontendJoinLink` explicitly. Expected file: ${joinLinkPath.safePathString}."
         )
     }
 
@@ -265,11 +307,19 @@ abstract class RunIdeTask : JavaExec(), RunnableIdeAware, SplitModeAware, Intell
             ?.resolveJavaRuntimeDirectory()
     }.getOrNull() ?: runtimeDirectory.asPath
 
+    private fun resolveJavaExecutable() = javaLauncher.orNull
+        ?.executablePath
+        ?.asFile
+        ?.absolutePath
+        ?: executable.takeIf { !it.isNullOrBlank() }
+        ?: throw GradleException("No Java executable resolved for task '$path'.")
+
     init {
         group = Plugin.GROUP_NAME
         description = "Runs the IDE instance using the currently selected IntelliJ Platform with the built plugin loaded."
         executionMode.convention(ExecutionMode.STANDARD)
         splitModeServerPort.convention(DEFAULT_SPLIT_MODE_SERVER_PORT)
+        splitModeFrontendJoinLinkWaitTimeout.convention(SPLIT_MODE_JOIN_LINK_WAIT_TIMEOUT_MS)
     }
 
     companion object : Registrable {
@@ -353,6 +403,14 @@ abstract class RunIdeTask : JavaExec(), RunnableIdeAware, SplitModeAware, Intell
         SPLIT_MODE_FRONTEND,
     }
 }
+
+internal data class ProcessSpec(
+    val workingDirectory: File,
+    val environment: Map<String, String>,
+    val commandLine: List<String>,
+    val standardOutput: OutputStream,
+    val errorOutput: OutputStream,
+)
 
 private class SplitModeJoinLinkOutputStream(
     private val delegate: OutputStream,

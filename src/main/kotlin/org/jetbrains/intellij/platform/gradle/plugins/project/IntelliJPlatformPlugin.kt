@@ -38,6 +38,7 @@ abstract class IntelliJPlatformPlugin : Plugin<Project> {
 
             // Run
             RunIdeTask,
+            RunIdeSplitModeTask,
 
             // Verify
             VerifyPluginTask,
